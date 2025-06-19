@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
+import wandb
 import yaml
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
@@ -178,6 +179,18 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
+    # Wandb configuration
+    # Enable wandb logging
+    use_wandb: bool = False
+    # Wandb project name
+    wandb_project: str = "gsplat_training"
+    # Wandb run name (optional, will auto-generate if None)
+    wandb_run_name: Optional[str] = None
+    # Wandb entity/team name (optional)
+    wandb_entity: Optional[str] = None
+    # Wandb tags
+    wandb_tags: Optional[List[str]] = None
+
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # 3DGUT (uncented transform + eval 3D)
@@ -330,6 +343,27 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
+        # Wandb initialization
+        if cfg.use_wandb and world_rank == 0:
+            # Only initialize wandb on the main process
+            wandb_config = {k: v for k, v in vars(cfg).items() if not k.startswith('wandb_')}
+            wandb_config.update({
+                'world_size': world_size,
+                'scene_scale': None,  # Will be updated after parser initialization
+                'num_train_images': None,  # Will be updated after dataset initialization
+                'num_val_images': None,  # Will be updated after dataset initialization
+            })
+            
+            wandb.init(
+                project=cfg.wandb_project,
+                name=cfg.wandb_run_name,
+                entity=cfg.wandb_entity,
+                tags=cfg.wandb_tags,
+                config=wandb_config,
+                save_code=True,
+                dir=cfg.result_dir
+            )
+
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
@@ -346,6 +380,15 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+
+        # Update wandb config with dataset information
+        if cfg.use_wandb and world_rank == 0:
+            wandb.config.update({
+                'scene_scale': self.scene_scale,
+                'num_train_images': len(self.trainset),
+                'num_val_images': len(self.valset),
+                'num_initial_points': len(self.parser.points) if hasattr(self.parser, 'points') else 0,
+            })
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -758,6 +801,30 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
+                # Wandb logging
+                if cfg.use_wandb:
+                    wandb_log = {
+                        "train/loss": loss.item(),
+                        "train/l1loss": l1loss.item(),
+                        "train/ssimloss": ssimloss.item(),
+                        "train/num_GS": len(self.splats["means"]),
+                        "train/mem_GB": mem,
+                        "train/sh_degree": sh_degree_to_use,
+                        "step": step,
+                    }
+                    if cfg.depth_loss:
+                        wandb_log["train/depthloss"] = depthloss.item()
+                    if cfg.use_bilateral_grid:
+                        wandb_log["train/tvloss"] = tvloss.item()
+                    if cfg.pose_opt and cfg.pose_noise:
+                        wandb_log["train/pose_error"] = pose_err.item()
+                    if cfg.tb_save_image:
+                        canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
+                        canvas = canvas.reshape(-1, *canvas.shape[2:])
+                        wandb_log["train/render_comparison"] = wandb.Image(canvas)
+                    
+                    wandb.log(wandb_log, step=step)
+
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -786,6 +853,22 @@ class Runner:
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+                
+                # Log checkpoint as wandb artifact
+                # if cfg.use_wandb:
+                #     artifact = wandb.Artifact(
+                #         f"checkpoint_step_{step}",
+                #         type="model",
+                #         description=f"Model checkpoint at step {step}",
+                #         metadata={
+                #             "step": step,
+                #             "num_gaussians": len(self.splats["means"]),
+                #             "memory_gb": mem,
+                #             "training_time": time.time() - global_tic
+                #         }
+                #     )
+                #     artifact.add_file(f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt")
+                #     wandb.log_artifact(artifact)
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
@@ -999,6 +1082,26 @@ class Runner:
             for k, v in stats.items():
                 self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
+
+            # save stats to wandb
+            if cfg.use_wandb:
+                wandb_eval_log = {f"{stage}/{k}": v for k, v in stats.items()}
+                wandb_eval_log["step"] = step
+                
+                # Add some sample validation images to wandb
+                if stage == "val" and len(metrics["psnr"]) > 0:
+                    # Log a few sample images (first 3)
+                    sample_indices = list(range(min(3, len(valloader))))
+                    sample_images = []
+                    for idx in sample_indices:
+                        img_path = f"{self.render_dir}/{stage}_step{step}_{idx:04d}.png"
+                        if os.path.exists(img_path):
+                            sample_images.append(wandb.Image(img_path, caption=f"Validation {idx}"))
+                    
+                    if sample_images:
+                        wandb_eval_log[f"{stage}/sample_renders"] = sample_images
+                
+                wandb.log(wandb_eval_log, step=step)
 
     @torch.no_grad()
     def render_traj(self, step: int):

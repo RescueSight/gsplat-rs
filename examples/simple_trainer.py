@@ -383,12 +383,15 @@ class Runner:
 
         # Update wandb config with dataset information
         if cfg.use_wandb and world_rank == 0:
-            wandb.config.update({
-                'scene_scale': self.scene_scale,
-                'num_train_images': len(self.trainset),
-                'num_val_images': len(self.valset),
-                'num_initial_points': len(self.parser.points) if hasattr(self.parser, 'points') else 0,
-            })
+            wandb.config.update(
+                {
+                    'scene_scale': self.scene_scale,
+                    'num_train_images': len(self.trainset),
+                    'num_val_images': len(self.valset),
+                    'num_initial_points': len(self.parser.points) if hasattr(self.parser, 'points') else 0,
+                },
+                allow_val_change=True,
+            )
 
         # Model
         feature_dim = 32 if cfg.app_opt else None

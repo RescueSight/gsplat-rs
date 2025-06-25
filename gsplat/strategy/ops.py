@@ -7,7 +7,7 @@ from torch import Tensor
 
 from gsplat import quat_scale_to_covar_preci
 from gsplat.relocation import compute_relocation
-from gsplat.utils import normalized_quat_to_rotmat
+from gsplat.utils import normalized_quat_to_rotmat, xyz_to_polar
 
 
 @torch.no_grad()
@@ -140,7 +140,11 @@ def split(
     device = mask.device
     sel = torch.where(mask)[0]
     rest = torch.where(~mask)[0]
-
+    means = params["means"][sel]
+    if "w" in params:
+        w_inv = 1.0 / torch.exp(params["w"][sel]).unsqueeze(1)
+        scales = scales * w_inv
+        means = means * w_inv
     scales = torch.exp(params["scales"][sel])
     quats = F.normalize(params["quats"][sel], dim=-1)
     rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
@@ -150,13 +154,22 @@ def split(
         scales,
         torch.randn(2, len(scales), 3, device=device),
     )  # [2, N, 3]
-
+    means = (means + samples).reshape(-1, 3)
+    if "w" in params:
+        w, _ = xyz_to_polar(means)  # [2N]
+        means = means * w.unsqueeze(1)  # [2N, 3]
     def param_fn(name: str, p: Tensor) -> Tensor:
         repeats = [2] + [1] * (p.dim() - 1)
         if name == "means":
-            p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
+            #p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
+            p_split = means  # [2N, 3]
+        elif name == "w":
+            p_split = torch.log(w)
         elif name == "scales":
-            p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+            #p_split = torch.log(scales / 1.6).repeat(2, 1)  # [2N, 3]
+            p_split = torch.log(torch.exp(params["scales"][sel]) / 1.6).repeat(
+                2, 1
+            )  # [2N, 3]
         elif name == "opacities" and revised_opacity:
             new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
             p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
@@ -269,9 +282,19 @@ def relocate(
     probs = opacities[alive_indices].flatten()  # ensure its shape is [N,]
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
     sampled_idxs = alive_indices[sampled_idxs]
+    scales = torch.exp(params["scales"])[sampled_idxs]
+    if "w" in params:
+        w = torch.exp(params["w"][sampled_idxs]).unsqueeze(1)
+        scales = scales / w
+    # new_opacities, new_scales = compute_relocation(
+    #     opacities=opacities[sampled_idxs],
+    #     scales=torch.exp(params["scales"])[sampled_idxs],
+    #     ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
+    #     binoms=binoms,
+    # )
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
-        scales=torch.exp(params["scales"])[sampled_idxs],
+        scales=scales,
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
     )
@@ -281,7 +304,11 @@ def relocate(
         if name == "opacities":
             p[sampled_idxs] = torch.logit(new_opacities)
         elif name == "scales":
-            p[sampled_idxs] = torch.log(new_scales)
+            #p[sampled_idxs] = torch.log(new_scales)
+            if "w" in params:
+                p[sampled_idxs] = torch.log(new_scales * w)
+            else:
+                p[sampled_idxs] = torch.log(new_scales)
         p[dead_indices] = p[sampled_idxs]
         return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
@@ -311,9 +338,19 @@ def sample_add(
     eps = torch.finfo(torch.float32).eps
     probs = opacities.flatten()
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+    scales = torch.exp(params["scales"])[sampled_idxs]
+    if "w" in params:
+        w = torch.exp(params["w"][sampled_idxs]).unsqueeze(1)
+        scales = scales / w
+    # new_opacities, new_scales = compute_relocation(
+    #     opacities=opacities[sampled_idxs],
+    #     scales=torch.exp(params["scales"])[sampled_idxs],
+    #     ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
+    #     binoms=binoms,
+    # )
     new_opacities, new_scales = compute_relocation(
         opacities=opacities[sampled_idxs],
-        scales=torch.exp(params["scales"])[sampled_idxs],
+        scales=scales,        
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
     )
@@ -323,7 +360,11 @@ def sample_add(
         if name == "opacities":
             p[sampled_idxs] = torch.logit(new_opacities)
         elif name == "scales":
-            p[sampled_idxs] = torch.log(new_scales)
+            #p[sampled_idxs] = torch.log(new_scales)
+            if "w" in params:
+                p[sampled_idxs] = torch.log(new_scales * w)
+            else:
+                p[sampled_idxs] = torch.log(new_scales)
         p_new = torch.cat([p, p[sampled_idxs]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
@@ -348,7 +389,12 @@ def inject_noise_to_position(
     scaler: float,
 ):
     opacities = torch.sigmoid(params["opacities"].flatten())
+    means = params["means"]
     scales = torch.exp(params["scales"])
+    if "w" in params:
+        w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
+        means = means * w_inv
+        scales = scales * w_inv
     covars, _ = quat_scale_to_covar_preci(
         params["quats"],
         scales,
@@ -366,4 +412,12 @@ def inject_noise_to_position(
         * scaler
     )
     noise = torch.einsum("bij,bj->bi", covars, noise)
-    params["means"].add_(noise)
+    #params["means"].add_(noise)
+    means = means + noise
+
+    if "w" in params:
+        w, _ = xyz_to_polar(means)
+        means = means * w.unsqueeze(1)
+        params["w"].data = torch.log(w.clamp_min(1e-8))
+
+    params["means"].data = means

@@ -32,6 +32,7 @@ from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
+from gsplat.utils import xyz_to_polar
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
@@ -39,6 +40,9 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+# Required for dashgaussian functionality
+from FastLanczos import lanczos_resample
+from schedule_utils import GsplatTrainingScheduler
 
 
 @dataclass
@@ -111,6 +115,9 @@ class Config:
     near_plane: float = 0.01
     # Far plane clipping distance
     far_plane: float = 1e10
+
+    # ABSGS
+    abs_gs: bool = False
 
     # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
@@ -200,6 +207,12 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    # Whether to use Dash Gaussian Implementation
+    dash_gaussian: bool = False
+
+    # Use homogeneous coordinates, 50k max_steps and 30k steps densifications recommended!
+    use_hom_coords: bool = False
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -240,6 +253,7 @@ def create_splats_with_optimizers(
     visible_adam: bool = False,
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
+    use_hom_coords: bool = False,
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
@@ -253,6 +267,11 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
+    if use_hom_coords:
+        w, _ = xyz_to_polar(points)
+        points *= w.unsqueeze(1)
+        w = torch.log(w)
+        w = w[world_rank::world_size]
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
@@ -274,7 +293,8 @@ def create_splats_with_optimizers(
         ("quats", torch.nn.Parameter(quats), quats_lr),
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
-
+    if use_hom_coords:
+        params.append(("w", torch.nn.Parameter(w), 0.0002 * scene_scale))
     if feature_dim is None:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
@@ -414,12 +434,29 @@ class Runner:
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
+            use_hom_coords=cfg.use_hom_coords,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+        if cfg.dash_gaussian:
+            # Collect training images
+            train_images = []
+            for i in range(len(self.trainset)):
+                data = self.trainset[i]
+                train_images.append(data["image"])
+            # Debug Info
 
+            # Initialize DashGaussian scheduler
+            self.dash_scheduler = GsplatTrainingScheduler(
+                cfg=cfg,
+                splats=self.splats,
+                train_images=train_images,
+                max_steps=cfg.max_steps,
+                densify_until_iter=cfg.strategy.refine_stop_iter if hasattr(cfg.strategy, 'refine_stop_iter') else None,
+                densification_interval=cfg.strategy.refine_every if hasattr(cfg.strategy, 'refine_every') else None,
+            )
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
@@ -542,7 +579,10 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
-
+        if cfg.use_hom_coords:
+            w_inv = 1.0 / torch.exp(self.splats["w"]).unsqueeze(1)
+            means = means * w_inv
+            scales = scales * w_inv
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
             colors = self.app_module(
@@ -608,6 +648,24 @@ class Runner:
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
+        # DASHGAUSSIAN: Modify LR scheduler if using DashGaussian
+        if cfg.dash_gaussian and hasattr(self, 'dash_scheduler'):
+            # Delay LR decay based on DashGaussian's resolution schedule
+            lr_decay_from = self.dash_scheduler.lr_decay_from_iter_value
+            schedulers[0] = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizers["means"],
+                schedulers=[
+                    torch.optim.lr_scheduler.ConstantLR(self.optimizers["means"], factor=1.0, total_iters=lr_decay_from),
+                    torch.optim.lr_scheduler.ExponentialLR(self.optimizers["means"], gamma=0.01 ** (1.0 / (max_steps - lr_decay_from)))
+                ],
+                milestones=[lr_decay_from]
+            )
+        if cfg.use_hom_coords:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.optimizers["w"], gamma=0.1 ** (0.005 / max_steps)
+                )
+            )
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -661,14 +719,45 @@ class Runner:
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            # DASHGAUSSIAN: Get current resolution scale
+            if cfg.dash_gaussian and hasattr(self, 'dash_scheduler'):
+                render_scale = self.dash_scheduler.get_res_scale(step)
+            else:
+                render_scale = 1.0
+            # DASHGAUSSIAN: Apply resolution scaling to ground truth
+            if render_scale > 1:
+                # Rescale pixels for each image in the batch
+                pixels_resized = []
+                for i in range(pixels.shape[0]):
+                    pixel = pixels[i]  # [H, W, 3]
+                    pixel_resized = lanczos_resample(pixel, scale_factor=render_scale)
+                    pixels_resized.append(pixel_resized)
+                pixels = torch.stack(pixels_resized)  # [B, H, W, 3]
+                
+                # Also rescale K matrix accordingly
+                scale_factor = 1.0 / render_scale
+                Ks = Ks.clone()
+                Ks[:, :2, :] *= scale_factor    
+
+            height, width = pixels.shape[1:3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            # DASHGAUSSIAN: Rescale masks if needed
+            if masks is not None and render_scale > 1:
+                masks = F.interpolate(
+                    masks.unsqueeze(1).float(), 
+                    size=(height, width), 
+                    mode='nearest'
+                ).squeeze(1).bool()
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+                # DASHGAUSSIAN: Scale point coordinates if resolution is scaled
+                if render_scale > 1:
+                    points = points * (1.0 / render_scale)
 
             height, width = pixels.shape[1:3]
 
@@ -716,6 +805,9 @@ class Runner:
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
+                
+            # DASHGAUSSIAN: Store info for densification control
+            pre_densify_n_gaussians = len(self.splats["means"])
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -769,7 +861,12 @@ class Runner:
 
             loss.backward()
 
+             # DASHGAUSSIAN: Update progress bar description
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            if cfg.dash_gaussian and hasattr(self, 'dash_scheduler'):
+                desc += f"R={render_scale:.1f}| "
+                desc += f"N_MAX={self.dash_scheduler.get_current_max_gaussians()}| "
+            desc += f"N_GS={len(self.splats['means'])}| "  # DASHGAUSSIAN: Moved this here
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -794,6 +891,11 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+
+                # DASHGAUSSIAN: Add DashGaussian-specific metrics
+                if cfg.dash_gaussian and hasattr(self, 'dash_scheduler'):
+                    self.writer.add_scalar("dashgaussian/render_scale", render_scale, step)
+                    self.writer.add_scalar("dashgaussian/max_n_gaussian", self.dash_scheduler.get_current_max_gaussians(), step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
@@ -836,6 +938,10 @@ class Runner:
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means"]),
                 }
+                # DASHGAUSSIAN: Add DashGaussian stats
+                if cfg.dash_gaussian and hasattr(self, 'dash_scheduler'):
+                    stats["dash_render_scale"] = render_scale
+                    stats["dash_max_n_gaussian"] = self.dash_scheduler.get_current_max_gaussians()
                 print("Step: ", step, stats)
                 with open(
                     f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
@@ -894,6 +1000,10 @@ class Runner:
 
                 means = self.splats["means"]
                 scales = self.splats["scales"]
+                if cfg.use_hom_coords:
+                    w_inv = 1.0 / torch.exp(self.splats["w"]).unsqueeze(1)
+                    means = means * w_inv
+                    scales = torch.log(torch.exp(scales) * w_inv)
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
                 export_splats(
@@ -950,6 +1060,22 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
+             # DASHGAUSSIAN: Custom densification control
+            if cfg.dash_gaussian and hasattr(self, 'dash_scheduler'):
+                # Intercept the strategy's densification to apply DashGaussian's control
+                if isinstance(self.cfg.strategy, DefaultStrategy):
+                    # Check if this is a densification step
+                    if self.dash_scheduler.should_densify(step):
+                        # Get the densification rate
+                        densify_rate = self.dash_scheduler.get_densify_rate(
+                            step, 
+                            len(self.splats["means"]), 
+                            render_scale
+                        )
+                        
+                        # Modify strategy state to control densification
+                        # This is a bit hacky but necessary to integrate with gsplat's strategy system
+                        self.strategy_state["controlled_densify_rate"] = densify_rate
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
@@ -972,7 +1098,12 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
-
+            # DASHGAUSSIAN: Update momentum after densification
+            if cfg.dash_gaussian and hasattr(self, 'dash_scheduler'):
+                post_densify_n_gaussians = len(self.splats["means"])
+                gaussians_added = post_densify_n_gaussians - pre_densify_n_gaussians
+                if gaussians_added > 0:
+                    self.dash_scheduler.update_momentum(gaussians_added)
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
@@ -1323,6 +1454,18 @@ if __name__ == "__main__":
                 strategy=DefaultStrategy(verbose=True),
             ),
         ),
+        "pixel": (
+            "Gaussian Splatting Using pixelGS",
+            Config(
+                strategy=DefaultStrategy(pixel_aware=True,gamma_depth=0.37,revised_opacity=True,verbose=True),
+            )
+        ),
+        "abs" : (
+            "Gaussian Splatting using AbsGS",
+            Config(
+                strategy=DefaultStrategy(absgrad=True,grow_grad2d=0.0008,verbose=True),
+            )
+        ),
         "mcmc": (
             "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
             Config(
@@ -1335,6 +1478,20 @@ if __name__ == "__main__":
         ),
     }
     cfg = tyro.extras.overridable_config_cli(configs)
+    if cfg.use_hom_coords:
+        cfg.max_steps = 50_000
+        if isinstance(cfg.strategy, DefaultStrategy):
+            cfg.strategy.refine_stop_iter = 30_000
+            cfg.strategy.refine_every = 200
+            cfg.strategy.reset_every = 6_000
+            cfg.strategy.refine_start_iter = 1_500
+            cfg.strategy.prune_too_big = False
+        elif isinstance(cfg.strategy, MCMCStrategy):
+            cfg.strategy.refine_start_iter: 1_500
+            cfg.strategy.refine_stop_iter: 40_000
+            cfg.strategy.refine_every: int = 200
+        else:
+            assert_never(cfg.strategy)
     cfg.adjust_steps(cfg.steps_scaler)
 
     # Import BilateralGrid and related functions based on configuration

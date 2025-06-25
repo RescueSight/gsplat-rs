@@ -30,6 +30,12 @@ class DefaultStrategy(Strategy):
     higher value, e.g., 0.0008. Also, the :func:`rasterization` function should be called
     with `absgrad=True` as well so that the absolute gradients are computed.
 
+    If `pixel_aware=True`, it will use the Pixel-GS strategy from:
+    
+    `Pixel-GS: Density Control with Pixel-aware Gradient for 3D Gaussian Splatting <https://arxiv.org/abs/2403.15530>`_
+    
+    Which weights gradients by pixel coverage and applies depth-based scaling to suppress floaters.
+
     Args:
         prune_opa (float): GSs with opacity below this value will be pruned. Default is 0.005.
         grow_grad2d (float): GSs with image plane gradient above this value will be
@@ -58,6 +64,8 @@ class DefaultStrategy(Strategy):
         key_for_gradient (str): Which variable uses for densification strategy.
           3DGS uses "means2d" gradient and 2DGS uses a similar gradient which stores
           in variable "gradient_2dgs".
+        pixel_aware (bool): Enable Pixel-GS modifications. Default is False.
+        gamma_depth (float): Depth scaling factor for Pixel-GS. Default is 0.37.
 
     Examples:
 
@@ -83,6 +91,7 @@ class DefaultStrategy(Strategy):
     prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
+    prune_too_big: bool = True
     refine_start_iter: int = 500
     refine_stop_iter: int = 15_000
     reset_every: int = 3000
@@ -92,6 +101,9 @@ class DefaultStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    # Pixel-GS specific parameters
+    pixel_aware: bool = False
+    gamma_depth: float = 0.37
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -107,6 +119,12 @@ class DefaultStrategy(Strategy):
         state = {"grad2d": None, "count": None, "scene_scale": scene_scale}
         if self.refine_scale2d_stop_iter > 0:
             state["radii"] = None
+        
+        # Pixel-GS specific state
+        if self.pixel_aware:
+            state["pixel_count_accum"] = None
+            state["weighted_grad_accum"] = None
+        
         return state
 
     def check_sanity(
@@ -190,6 +208,11 @@ class DefaultStrategy(Strategy):
             state["count"].zero_()
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
+            if self.pixel_aware:
+                if state["pixel_count_accum"] is not None:
+                    state["pixel_count_accum"].zero_()
+                if state["weighted_grad_accum"] is not None:
+                    state["weighted_grad_accum"].zero_()
             torch.cuda.empty_cache()
 
         if step % self.reset_every == 0:
@@ -235,6 +258,13 @@ class DefaultStrategy(Strategy):
         if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
             assert "radii" in info, "radii is required but missing."
             state["radii"] = torch.zeros(n_gaussian, device=grads.device)
+        
+        # Initialize Pixel-GS specific state
+        if self.pixel_aware:
+            if state["pixel_count_accum"] is None:
+                state["pixel_count_accum"] = torch.zeros(n_gaussian, device=grads.device)
+            if state["weighted_grad_accum"] is None:
+                state["weighted_grad_accum"] = torch.zeros(n_gaussian, device=grads.device)
 
         # update the running state
         if packed:
@@ -247,10 +277,37 @@ class DefaultStrategy(Strategy):
             gs_ids = torch.where(sel)[1]  # [nnz]
             grads = grads[sel]  # [nnz, 2]
             radii = info["radii"][sel].max(dim=-1).values  # [nnz]
-        state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+        
+        grad_norms = grads.norm(dim=-1)
+        
+        if self.pixel_aware:
+            # Pixel-GS: weight gradients by pixel coverage and apply depth scaling
+            
+            # Approximate pixel counts using projected area
+            pixel_counts = torch.clamp(3.14159 * radii * radii, min=1.0)
+            
+            # Apply depth-based gradient scaling if depth information is available
+            if "depths" in info:
+                depths = info["depths"]
+                if packed:
+                    depths = depths[gs_ids]
+                else:
+                    depths = depths[sel]
+                depth_scale = self._compute_depth_scale(depths, state["scene_scale"])
+            else:
+                depth_scale = 1.0
+            
+            # Accumulate weighted gradients
+            weighted_grads = grad_norms * pixel_counts * depth_scale
+            state["weighted_grad_accum"].index_add_(0, gs_ids, weighted_grads)
+            state["pixel_count_accum"].index_add_(0, gs_ids, pixel_counts)
+        
+        # Standard accumulation (always done for compatibility)
+        state["grad2d"].index_add_(0, gs_ids, grad_norms)
         state["count"].index_add_(
             0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
         )
+        
         if self.refine_scale2d_stop_iter > 0:
             # Should be ideally using scatter max
             state["radii"][gs_ids] = torch.maximum(
@@ -258,6 +315,11 @@ class DefaultStrategy(Strategy):
                 # normalize radii to [0, 1] screen space
                 radii / float(max(info["width"], info["height"])),
             )
+
+    def _compute_depth_scale(self, depths: torch.Tensor, scene_scale: float) -> torch.Tensor:
+        """Compute depth-based gradient scaling factor for Pixel-GS."""
+        scale_factor = (depths / (self.gamma_depth * scene_scale)) ** 2
+        return torch.clamp(scale_factor, 0.0, 1.0)
 
     @torch.no_grad()
     def _grow_gs(
@@ -268,14 +330,28 @@ class DefaultStrategy(Strategy):
         step: int,
     ) -> Tuple[int, int]:
         count = state["count"]
-        grads = state["grad2d"] / count.clamp_min(1)
+        
+        if self.pixel_aware and state["pixel_count_accum"] is not None:
+            # Pixel-GS: use pixel-weighted gradients
+            pixel_counts = torch.clamp(state["pixel_count_accum"], min=1.0)
+            grads = state["weighted_grad_accum"] / pixel_counts
+        else:
+            # Standard: use average gradients
+            grads = state["grad2d"] / count.clamp_min(1)
+        
         device = grads.device
 
         is_grad_high = grads > self.grow_grad2d
-        is_small = (
-            torch.exp(params["scales"]).max(dim=-1).values
-            <= self.grow_scale3d * state["scene_scale"]
-        )
+        # is_small = (
+        #     torch.exp(params["scales"]).max(dim=-1).values
+        #     <= self.grow_scale3d * state["scene_scale"]
+        # )
+        scales = torch.exp(params["scales"])
+        if "w" in params:
+            w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
+            scales = scales * w_inv
+
+        is_small = scales.max(dim=-1).values <= self.grow_scale3d * state["scene_scale"]
         is_dupli = is_grad_high & is_small
         n_dupli = is_dupli.sum().item()
 
@@ -317,11 +393,17 @@ class DefaultStrategy(Strategy):
         step: int,
     ) -> int:
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
-        if step > self.reset_every:
-            is_too_big = (
-                torch.exp(params["scales"]).max(dim=-1).values
-                > self.prune_scale3d * state["scene_scale"]
-            )
+        #if step > self.reset_every:
+        if step > self.reset_every and self.prune_too_big:
+            scales = torch.exp(params["scales"])
+            if "w" in params:
+                w_inv = 1.0 / torch.exp(params["w"]).unsqueeze(1)
+                scales = scales * w_inv
+            # is_too_big = (
+            #     torch.exp(params["scales"]).max(dim=-1).values
+            #     > self.prune_scale3d * state["scene_scale"]
+            # )
+            is_too_big = (scales.max(dim=-1).values > self.prune_scale3d * state["scene_scale"])
             # The official code also implements sreen-size pruning but
             # it's actually not being used due to a bug:
             # https://github.com/graphdeco-inria/gaussian-splatting/issues/123

@@ -141,11 +141,11 @@ def split(
     sel = torch.where(mask)[0]
     rest = torch.where(~mask)[0]
     means = params["means"][sel]
+    scales = torch.exp(params["scales"][sel])
     if "w" in params:
         w_inv = 1.0 / torch.exp(params["w"][sel]).unsqueeze(1)
         scales = scales * w_inv
         means = means * w_inv
-    scales = torch.exp(params["scales"][sel])
     quats = F.normalize(params["quats"][sel], dim=-1)
     rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
     samples = torch.einsum(

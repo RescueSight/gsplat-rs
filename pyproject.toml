@@ -1,0 +1,7 @@
+[build-system]
+requires = [
+    "setuptools>=61",
+    "wheel",
+    # Runtime build dependencies already required by setup.py
+]
+build-backend = "setuptools.build_meta"
